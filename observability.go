@@ -24,6 +24,19 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 )
 
+func getGcpProjectID() string {
+	projectID, err := metadata.ProjectIDWithContext(context.Background())
+	if err != nil {
+		// We're not in the cloud either, so must be unit tests
+		projectID = "local"
+	}
+	return projectID
+}
+
+// This operation is expensive, so do it once on start up which will be fine
+// for any GCP deployments.
+var GCPProjectID = getGcpProjectID()
+
 func NewLogrusAndTraceAwareFiberApp(ctx context.Context, serviceName string) (*fiber.App, func(context.Context) error) {
 	logrus.SetOutput(os.Stdout)
 	logrus.SetFormatter(&logrus.JSONFormatter{})
@@ -56,15 +69,6 @@ func SafeShutdown(errs ...error) {
 	}
 }
 
-func getGcpProjectID(ctx context.Context) string {
-	projectID, err := metadata.ProjectIDWithContext(ctx)
-	if err != nil {
-		// We're not in the cloud either, so must be unit tests
-		projectID = ""
-	}
-	return projectID
-}
-
 // If this logger is created within a context that has OpenTelemetry tracing
 // information attached, incorporate that into the logger in a format designed
 // for GCP's Cloud Trace.
@@ -74,7 +78,7 @@ func newTraceAwareLogrusLogger(ctx context.Context) *logrus.Entry {
 	logger := logrus.NewEntry(logrus.New())
 
 	if spanContext.IsValid() {
-		traceId := "projects/" + getGcpProjectID(ctx) + "/traces/" + spanContext.TraceID().String()
+		traceId := "projects/" + GCPProjectID + "/traces/" + spanContext.TraceID().String()
 		logger = logrus.WithFields(logrus.Fields{
 			"logging.googleapis.com/trace":        traceId,
 			"logging.googleapis.com/spanId":       spanContext.SpanID().String(),
@@ -102,9 +106,10 @@ func GetLogger(c *fiber.Ctx) *logrus.Entry {
 func setupOpenTelemetry(ctx context.Context, serviceName string) (shutdown func(context.Context) error, err error) {
 	var res *resource.Resource
 	var traceExporter trace.SpanExporter
+	var tracerProvider *trace.TracerProvider
 
 	if os.Getenv("ENABLE_GCP_TRACING") == "true" {
-		traceExporter, err = texporter.New(texporter.WithProjectID(getGcpProjectID(ctx)))
+		traceExporter, err = texporter.New(texporter.WithProjectID(GCPProjectID))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create resource: %w", err)
 		}
@@ -119,6 +124,13 @@ func setupOpenTelemetry(ctx context.Context, serviceName string) (shutdown func(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create resource: %w", err)
 		}
+		tracerProvider = trace.NewTracerProvider(
+			trace.WithBatcher(traceExporter),
+			trace.WithResource(res),
+			// In prod, sample based on whether the parent trace is sampled, or
+			// default to 1% of traces.
+			trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(0.01))),
+		)
 	} else {
 		res, err = resource.New(ctx,
 			resource.WithAttributes(
@@ -133,15 +145,15 @@ func setupOpenTelemetry(ctx context.Context, serviceName string) (shutdown func(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create trace exporter: %w", err)
 		}
+		tracerProvider = trace.NewTracerProvider(
+			trace.WithBatcher(traceExporter),
+			trace.WithResource(res),
+			// Locally, sample every request so it's easy to debug.
+			trace.WithSampler(trace.AlwaysSample()),
+		)
 	}
 
 	otel.SetTextMapPropagator(autoprop.NewTextMapPropagator())
-
-	tracerProvider := trace.NewTracerProvider(
-		trace.WithBatcher(traceExporter),
-		trace.WithResource(res),
-	)
-
 	otel.SetTracerProvider(tracerProvider)
 
 	shutdown = func(ctx context.Context) error {
