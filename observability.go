@@ -25,10 +25,10 @@ import (
 )
 
 func getGcpProjectID() string {
-	projectID, err := metadata.ProjectIDWithContext(context.Background())
-	if err != nil {
-		// We're not in the cloud either, so must be unit tests
-		projectID = "local"
+	projectID := "local"
+	var err error
+	if os.Getenv("ENABLE_GCP_TRACING") == "true" {
+		projectID, _ = metadata.ProjectIDWithContext(context.Background())
 	}
 	return projectID
 }
