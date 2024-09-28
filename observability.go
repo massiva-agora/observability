@@ -26,7 +26,6 @@ import (
 
 func getGcpProjectID() string {
 	projectID := "local"
-	var err error
 	if os.Getenv("ENABLE_GCP_TRACING") == "true" {
 		projectID, _ = metadata.ProjectIDWithContext(context.Background())
 	}
